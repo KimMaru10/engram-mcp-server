@@ -1,0 +1,23 @@
+# Personal memory database — never commit
+memory.db
+memory.db-journal
+memory.db-wal
+memory.db-shm
+*.db
+
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
