@@ -8,7 +8,7 @@ Provides persistent memory across sessions using:
 - sqlite-vec + sentence-transformers (Ruri v3-310m) for vector search
 - RRF (Reciprocal Rank Fusion) to merge results
 - Time decay (half-life 30 days)
-- Auto deduplication and pruning
+- Near-exact deduplication (old versions kept in memories_history) and pruning
 """
 
 import json
@@ -48,7 +48,16 @@ DB_PATH = Path(os.environ.get("ENGRAM_DB_PATH", Path.home() / ".claude" / "engra
 MODEL_NAME = "cl-nagoya/ruri-v3-310m"
 HALF_LIFE_DAYS = 30
 MAX_MEMORIES = 10_000
-DEDUP_THRESHOLD = 0.90
+# ruri-v3 では同じ project の無関係な記憶同士でも中央値 0.87 前後になるため、
+# 手動保存の置換はほぼ同一文に限る。似ているだけの記憶は置換せず similar として返す。
+DEDUP_THRESHOLD = 0.98
+SIMILAR_THRESHOLD = 0.90
+# 自動保存(フック)のセッション要約は従来どおり緩く統合する。手動保存の記憶とは突き合わせない。
+AUTO_SAVE_TAG = "auto-save"  # ~/.claude/hooks/save-session-to-engram.py の tags と揃える
+AUTO_SAVE_DEDUP_THRESHOLD = 0.90
+DEDUP_CANDIDATES = 20
+# 自動保存は「統合 or 新規」の二択にしたいので、統合しきい値は similar の下限以上にする
+assert AUTO_SAVE_DEDUP_THRESHOLD >= SIMILAR_THRESHOLD
 VECTOR_DIM = 768  # ruri-v3-310m output dimension
 RRF_K = 60  # RRF constant
 
@@ -125,6 +134,21 @@ def _get_db() -> sqlite3.Connection:
             VALUES ('delete', old.id, old.content, old.tags);
         END;
 
+        CREATE TABLE IF NOT EXISTS memories_history (
+            history_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id   INTEGER NOT NULL,
+            content     TEXT NOT NULL,
+            tags        TEXT DEFAULT '',
+            replaced_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_history_memory_id ON memories_history(memory_id);
+
+        CREATE TRIGGER IF NOT EXISTS memories_hist BEFORE UPDATE OF content, tags ON memories
+        WHEN old.content IS NOT new.content OR old.tags IS NOT new.tags BEGIN
+            INSERT INTO memories_history(memory_id, content, tags, replaced_at)
+            VALUES (old.id, old.content, old.tags, unixepoch('subsec'));
+        END;
+
         CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
             INSERT INTO memories_fts(memories_fts, rowid, content, tags)
             VALUES ('delete', old.id, old.content, old.tags);
@@ -161,60 +185,63 @@ def _embed(text: str) -> np.ndarray:
     return model.encode(text, normalize_embeddings=True)
 
 
-def _find_duplicate(content: str, project: str) -> int | None:
-    """Check if a similar memory already exists. Returns id if found."""
-    db = _get_db()
-    query_vec = _embed(content)
+def _is_auto(tags: str) -> bool:
+    return AUTO_SAVE_TAG in [t.strip() for t in (tags or "").split(",")]
 
-    # Search top 5 candidates by vector similarity
+
+def _find_similar(query_vec: np.ndarray, project: str, auto: bool) -> list[tuple[int, float]]:
+    """Same-project, same-kind (auto-save or not) memories with sim >= SIMILAR_THRESHOLD, best first."""
+    db = _get_db()
     rows = db.execute(
         """
-        SELECT id, distance
-        FROM memories_vec
+        SELECT id FROM memories_vec
         WHERE embedding MATCH ?
         ORDER BY distance
-        LIMIT 5
+        LIMIT ?
         """,
-        [_serialize_vec(query_vec)],
+        [_serialize_vec(query_vec), DEDUP_CANDIDATES],
     ).fetchall()
 
-    if not rows:
-        return None
-
+    found = []
     for row in rows:
         mem = db.execute(
-            "SELECT id, project, embedding FROM memories WHERE id = ?",
+            "SELECT id, project, tags, embedding FROM memories WHERE id = ?",
             [row["id"]],
         ).fetchone()
-        if mem and mem["project"] == project and mem["embedding"]:
-            sim = _cosine_similarity(query_vec, _deserialize_vec(mem["embedding"]))
-            if sim >= DEDUP_THRESHOLD:
-                return mem["id"]
+        if not mem or mem["project"] != project or not mem["embedding"] or _is_auto(mem["tags"]) != auto:
+            continue
+        sim = _cosine_similarity(query_vec, _deserialize_vec(mem["embedding"]))
+        if sim >= SIMILAR_THRESHOLD:
+            found.append((mem["id"], sim))
+    return sorted(found, key=lambda x: x[1], reverse=True)
 
-    return None
+
+def _replace_memory(db: sqlite3.Connection, mem_id: int, content: str, tags: str, vec: np.ndarray, now: float):
+    """Overwrite a memory; the old version is kept by the memories_hist trigger."""
+    db.execute(
+        "UPDATE memories SET content = ?, tags = ?, last_hit_at = ?, embedding = ? WHERE id = ?",
+        [content, tags, now, _serialize_vec(vec), mem_id],
+    )
+    db.execute("DELETE FROM memories_vec WHERE id = ?", [mem_id])
+    db.execute(
+        "INSERT INTO memories_vec(id, embedding) VALUES (?, ?)",
+        [mem_id, _serialize_vec(vec)],
+    )
+    db.commit()
 
 
 def _save_memory(content: str, project: str = "", tags: str = "") -> dict:
     db = _get_db()
     now = time.time()
     vec = _embed(content)
+    auto = _is_auto(tags)
+    threshold = AUTO_SAVE_DEDUP_THRESHOLD if auto else DEDUP_THRESHOLD
 
-    # Check for duplicate
-    dup_id = _find_duplicate(content, project)
-    if dup_id:
-        db.execute(
-            "UPDATE memories SET content = ?, tags = ?, last_hit_at = ? WHERE id = ?",
-            [content, tags, now, dup_id],
-        )
-        db.execute(
-            "DELETE FROM memories_vec WHERE id = ?", [dup_id]
-        )
-        db.execute(
-            "INSERT INTO memories_vec(id, embedding) VALUES (?, ?)",
-            [dup_id, _serialize_vec(vec)],
-        )
-        db.commit()
-        return {"status": "updated", "id": dup_id, "message": "Similar memory found and updated"}
+    similar = _find_similar(vec, project, auto)
+    if similar and similar[0][1] >= threshold:
+        dup_id = similar[0][0]
+        _replace_memory(db, dup_id, content, tags, vec, now)
+        return {"status": "updated", "id": dup_id, "message": "Near-identical memory found and updated (old version kept in history)"}
 
     # Insert new
     cur = db.execute(
@@ -231,7 +258,38 @@ def _save_memory(content: str, project: str = "", tags: str = "") -> dict:
     # Enforce max limit
     _enforce_limit(db)
 
-    return {"status": "created", "id": mem_id, "message": "Memory saved"}
+    result = {"status": "created", "id": mem_id, "message": "Memory saved"}
+    if similar:
+        result["similar"] = [{"id": i, "similarity": round(sim, 3)} for i, sim in similar[:5]]
+        result["message"] += ". Similar memories exist; use update(memory_id, ...) if this should replace one"
+    return result
+
+
+def _update_memory(memory_id: int, content: str, tags: str | None = None) -> dict:
+    db = _get_db()
+    row = db.execute("SELECT tags FROM memories WHERE id = ?", [memory_id]).fetchone()
+    if not row:
+        return {"status": "error", "message": f"Memory {memory_id} not found"}
+    new_tags = row["tags"] if tags is None else tags
+    _replace_memory(db, memory_id, content, new_tags, _embed(content), time.time())
+    return {"status": "updated", "id": memory_id, "message": "Memory updated (old version kept in history)"}
+
+
+def _history(memory_id: int) -> list[dict]:
+    db = _get_db()
+    rows = db.execute(
+        "SELECT history_id, content, tags, replaced_at FROM memories_history WHERE memory_id = ? ORDER BY replaced_at DESC",
+        [memory_id],
+    ).fetchall()
+    return [
+        {
+            "history_id": r["history_id"],
+            "content": r["content"],
+            "tags": r["tags"],
+            "replaced_at": datetime.fromtimestamp(r["replaced_at"], tz=timezone.utc).isoformat(),
+        }
+        for r in rows
+    ]
 
 
 def _enforce_limit(db: sqlite3.Connection):
@@ -428,7 +486,11 @@ mcp = FastMCP("engram")
 
 @mcp.tool()
 def save(content: str, project: str = "", tags: str = "") -> str:
-    """Save a memory.
+    """Save a new memory.
+
+    Always creates a new memory unless a near-identical one (similarity >= 0.98) exists in the
+    same project. Similar-but-different memories are listed in "similar"; to replace one of them
+    on purpose, call update(memory_id, ...) instead.
 
     Args:
         content: The text content to remember.
@@ -437,6 +499,28 @@ def save(content: str, project: str = "", tags: str = "") -> str:
     """
     result = _save_memory(content, project, tags)
     return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def update(memory_id: int, content: str, tags: str | None = None) -> str:
+    """Replace the content of a specific memory on purpose. The old version is kept in history.
+
+    Args:
+        memory_id: The ID of the memory to replace.
+        content: The new full text (replaces the old text entirely).
+        tags: New comma-separated tags. Omit to keep the current tags.
+    """
+    return json.dumps(_update_memory(memory_id, content, tags), ensure_ascii=False)
+
+
+@mcp.tool()
+def history(memory_id: int) -> str:
+    """Show previous versions of a memory (content replaced by save/update), newest first.
+
+    Args:
+        memory_id: The ID of the memory.
+    """
+    return json.dumps({"memory_id": memory_id, "versions": _history(memory_id)}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
