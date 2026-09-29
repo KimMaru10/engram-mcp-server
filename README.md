@@ -9,7 +9,8 @@ Long-term memory MCP server for Claude Code — hybrid search (SQLite FTS5 + sql
 - **ハイブリッド検索**: SQLite FTS5 (trigram) によるキーワード検索 + sqlite-vec によるベクトル検索を **RRF (Reciprocal Rank Fusion)** で統合
 - **日本語対応の埋め込み**: [Ruri v3 310m](https://huggingface.co/cl-nagoya/ruri-v3-310m) を使用
 - **時間減衰**: 半減期 30 日の指数減衰スコアリング
-- **自動重複排除**: コサイン類似度 0.90 以上の記憶は更新扱い
+- **重複排除**: 同じ project でコサイン類似度 0.98 以上(ほぼ同一文)の記憶だけ置き換える。似ているだけの記憶は置き換えず `similar` として返す。自動保存(`auto-save` タグ)の要約どうしは 0.90 以上で統合し、手動の記憶とは突き合わせない
+- **上書き履歴**: 置き換え前の本文とタグは `memories_history` に残り、`history(memory_id)` で見られる
 - **自動プルーニング**: 最大 10,000 件を超えると、ヒット数の少ない古いものから削除
 - **プロジェクト別管理**: `project` フィールドでスコープを分離可能
 
@@ -61,7 +62,9 @@ claude mcp add engram \
 
 | ツール | 説明 |
 | --- | --- |
-| `save(content, project="", tags="")` | 記憶を保存。類似する既存記憶があれば更新 |
+| `save(content, project="", tags="")` | 記憶を新規保存。ほぼ同一の記憶だけ置き換える。似た記憶は結果の `similar` に id と類似度を返す |
+| `update(memory_id, content, tags=None)` | 指定 ID の記憶を意図して置き換える(tags 省略で維持)。旧版は履歴に残る |
+| `history(memory_id)` | 指定 ID の過去の版を新しい順に表示 |
 | `search(query, project="", limit=5)` | ハイブリッド検索（キーワード + 意味）+ 時間減衰でランキング |
 | `prune(older_than_days=90, project="")` | 指定日数アクセスのない記憶を削除 |
 | `stats(project="")` | 件数・最古/最新・プロジェクト別統計・DB サイズ |
@@ -80,7 +83,9 @@ claude mcp add engram \
 | `MODEL_NAME` | `cl-nagoya/ruri-v3-310m` | 埋め込みモデル |
 | `HALF_LIFE_DAYS` | `30` | 時間減衰の半減期（日） |
 | `MAX_MEMORIES` | `10000` | 上限件数（超過分は古い順に自動削除） |
-| `DEDUP_THRESHOLD` | `0.90` | 重複判定のコサイン類似度しきい値 |
+| `DEDUP_THRESHOLD` | `0.98` | 手動保存で置き換えるしきい値(ruri-v3 では無関係な同 project の記憶同士でも中央値 0.87 前後になるため高めにする) |
+| `SIMILAR_THRESHOLD` | `0.90` | `similar` として返すしきい値 |
+| `AUTO_SAVE_DEDUP_THRESHOLD` | `0.90` | `auto-save` タグの要約どうしを統合するしきい値 |
 | `RRF_K` | `60` | RRF 定数 |
 
 ## アーキテクチャ
@@ -93,7 +98,8 @@ claude mcp add engram \
 ┌──────▼───────────────────────────────────┐
 │            engram (server.py)            │
 ├──────────────────────────────────────────┤
-│  save / search / prune / stats / delete  │
+│  save / update / history / search /      │
+│  prune / stats / delete                  │
 └──────┬───────────────────────────────────┘
        │
 ┌──────▼─────────────────────────────────┐
